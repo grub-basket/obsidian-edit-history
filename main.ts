@@ -267,6 +267,9 @@ export default class EditHistory extends Plugin {
 
         let text: string;
         let tooltip: string;
+        // Only the tracked-file state opens the modal on click; mirror that on
+        // the cursor so the other states don't look clickable.
+        let clickable = false;
         const file = this.getActiveFileViewFile();
         if (file == null) {
             // No file view is active (a custom editor / non-file view, or an
@@ -290,14 +293,17 @@ export default class EditHistory extends Plugin {
                     logError("Error reading edit history for status bar", zipFilepath, e);
                     this.statusBarItemEl.setText("? edits");
                     this.statusBarItemEl.setAttribute("aria-label", "Edit History: couldn't read the history file");
+                    this.statusBarItemEl.toggleClass("mod-clickable", false);
                     return;
                 }
             }
             text = numEdits + " edits";
             tooltip = "Show edit history for this file";
+            clickable = true;
         }
         this.statusBarItemEl.setText(text);
         this.statusBarItemEl.setAttribute("aria-label", tooltip);
+        this.statusBarItemEl.toggleClass("mod-clickable", clickable);
     }
 
     getEditHistoryFilepath(filepath: string): string {
@@ -825,15 +831,19 @@ export default class EditHistory extends Plugin {
 
         const statusBarItemEl = this.addStatusBarItem();
         statusBarItemEl.setText("? edits");
-        // Add the highlight on hover of other status bar items
-        statusBarItemEl.addClass("mod-clickable");
         this.statusBarItemEl = statusBarItemEl;
         const plugin = this;
         statusBarItemEl.onclick = function () {
-            if (plugin.keepEditHistoryForActiveFile()) {
+            // Resolve the file the same way the status bar text does (the active
+            // FileView, not workspace.getActiveFile()), so clicking only opens
+            // the modal when the bar actually shows a tracked file's count and
+            // never for a non-file view that getActiveFile() would resolve to a
+            // background note.
+            const file = plugin.getActiveFileViewFile();
+            if ((file != null) && plugin.keepEditHistoryForFile(file)) {
                 new EditHistoryModal(plugin).open();
             }
-        }; 
+        };
         
         this.statusBarItemEl.toggle(this.settings.showOnStatusBar);
 
