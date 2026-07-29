@@ -1,9 +1,10 @@
 import { 
-    App, 
-    ButtonComponent, 
+    App,
+    ButtonComponent,
     DropdownComponent,
-    Modal, 
-    normalizePath, 
+    FileView,
+    Modal,
+    normalizePath,
     Notice,
     Plugin, 
     PluginSettingTab, 
@@ -239,7 +240,52 @@ export default class EditHistory extends Plugin {
 
         return ((activeFile != null) && (this.keepEditHistoryForFile(activeFile)));
     }
-    
+
+    /**
+     * @return the file shown in the currently active leaf if edit history is
+     *         kept for it, otherwise null. Reads the active FileView's file
+     *         rather than workspace.getActiveFile() so switching to a non-file
+     *         view (eg a plugin's own view) reports "no active file" instead of
+     *         falling back to the last opened note.
+     */
+    getActiveEditHistoryFile(): TFile | null {
+        const view = this.app.workspace.getActiveViewOfType(FileView);
+        const file = (view != null) ? view.file : null;
+        return ((file != null) && this.keepEditHistoryForFile(file)) ? file : null;
+    }
+
+    /**
+     * Refresh the status bar edit count for the currently active file. Called
+     * on load and whenever the active leaf or open file changes, so the count
+     * follows the file the user is looking at rather than the last saved one.
+     */
+    async updateStatusBar() {
+        if ((this.statusBarItemEl == null) || !this.settings.showOnStatusBar) {
+            return;
+        }
+        const file = this.getActiveEditHistoryFile();
+        if (file == null) {
+            this.statusBarItemEl.setText("? edits");
+            return;
+        }
+        const zipFilepath = this.getEditHistoryFilepath(file.path);
+        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+        if ((zipFile == null) || !(zipFile instanceof TFile)) {
+            this.statusBarItemEl.setText("0 edits");
+            return;
+        }
+        try {
+            const zip = new JSZip();
+            await zip.loadAsync(await this.app.vault.readBinary(zipFile));
+            let numEdits = 0;
+            zip.forEach(() => { numEdits++; });
+            this.statusBarItemEl.setText(numEdits + " edits");
+        } catch (e) {
+            logError("Error reading edit history for status bar", zipFilepath, e);
+            this.statusBarItemEl.setText("? edits");
+        }
+    }
+
     getEditHistoryFilepath(filepath: string): string {
         return normalizePath(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
     }
@@ -776,7 +822,14 @@ export default class EditHistory extends Plugin {
         }; 
         
         this.statusBarItemEl.toggle(this.settings.showOnStatusBar);
-        
+
+        // Keep the status bar count in sync with the active file, not just the
+        // last saved one. active-leaf-change covers tab switches (including to
+        // custom/non-file views); file-open covers opening a file in place.
+        this.registerEvent(this.app.workspace.on("active-leaf-change", () => { this.updateStatusBar(); }));
+        this.registerEvent(this.app.workspace.on("file-open", () => { this.updateStatusBar(); }));
+        this.app.workspace.onLayoutReady(() => { this.updateStatusBar(); });
+
         this.addCommand({
             id: "open-edit-history",
             name: "Open edit history for this file",
