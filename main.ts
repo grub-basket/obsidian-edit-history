@@ -242,48 +242,62 @@ export default class EditHistory extends Plugin {
     }
 
     /**
-     * @return the file shown in the currently active leaf if edit history is
-     *         kept for it, otherwise null. Reads the active FileView's file
-     *         rather than workspace.getActiveFile() so switching to a non-file
-     *         view (eg a plugin's own view) reports "no active file" instead of
-     *         falling back to the last opened note.
+     * @return the file shown in the currently active leaf, or null if the
+     *         active leaf isn't a file view. Reads the active FileView's file
+     *         rather than workspace.getActiveFile(), which falls back to the
+     *         last opened note when a non-file view (eg a plugin's own view) is
+     *         focused.
      */
-    getActiveEditHistoryFile(): TFile | null {
+    getActiveFileViewFile(): TFile | null {
         const view = this.app.workspace.getActiveViewOfType(FileView);
-        const file = (view != null) ? view.file : null;
-        return ((file != null) && this.keepEditHistoryForFile(file)) ? file : null;
+        return (view != null) ? view.file : null;
     }
 
     /**
-     * Refresh the status bar edit count for the currently active file. Called
-     * on load and whenever the active leaf or open file changes, so the count
-     * follows the file the user is looking at rather than the last saved one.
+     * Refresh the status bar for the currently active file. Called on load and
+     * whenever the active leaf or open file changes, so it follows the file the
+     * user is looking at rather than the last saved one. Distinguishes: a
+     * tracked file's edit count, a file whose type isn't tracked, and a
+     * non-file view (a custom editor) with no file to track.
      */
     async updateStatusBar() {
         if ((this.statusBarItemEl == null) || !this.settings.showOnStatusBar) {
             return;
         }
-        const file = this.getActiveEditHistoryFile();
+
+        let text: string;
+        let tooltip: string;
+        const file = this.getActiveFileViewFile();
         if (file == null) {
-            this.statusBarItemEl.setText("? edits");
-            return;
-        }
-        const zipFilepath = this.getEditHistoryFilepath(file.path);
-        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-        if ((zipFile == null) || !(zipFile instanceof TFile)) {
-            this.statusBarItemEl.setText("0 edits");
-            return;
-        }
-        try {
-            const zip = new JSZip();
-            await zip.loadAsync(await this.app.vault.readBinary(zipFile));
+            // No file view is active (a custom editor / non-file view, or an
+            // empty tab), so there's nothing to keep history for.
+            text = "no file";
+            tooltip = "Edit History: no file open to track";
+        } else if (!this.keepEditHistoryForFile(file)) {
+            // A file, but its type isn't in the tracked formats.
+            text = "not tracked";
+            tooltip = "Edit History: this file type isn't tracked (see the plugin settings)";
+        } else {
+            const zipFilepath = this.getEditHistoryFilepath(file.path);
+            const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
             let numEdits = 0;
-            zip.forEach(() => { numEdits++; });
-            this.statusBarItemEl.setText(numEdits + " edits");
-        } catch (e) {
-            logError("Error reading edit history for status bar", zipFilepath, e);
-            this.statusBarItemEl.setText("? edits");
+            if ((zipFile != null) && (zipFile instanceof TFile)) {
+                try {
+                    const zip = new JSZip();
+                    await zip.loadAsync(await this.app.vault.readBinary(zipFile));
+                    zip.forEach(() => { numEdits++; });
+                } catch (e) {
+                    logError("Error reading edit history for status bar", zipFilepath, e);
+                    this.statusBarItemEl.setText("? edits");
+                    this.statusBarItemEl.setAttribute("aria-label", "Edit History: couldn't read the history file");
+                    return;
+                }
+            }
+            text = numEdits + " edits";
+            tooltip = "Show edit history for this file";
         }
+        this.statusBarItemEl.setText(text);
+        this.statusBarItemEl.setAttribute("aria-label", tooltip);
     }
 
     getEditHistoryFilepath(filepath: string): string {
