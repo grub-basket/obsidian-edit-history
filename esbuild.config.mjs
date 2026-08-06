@@ -52,12 +52,40 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
+// JSZip's browser shim resolves "readable-stream" to `require("stream")` so a
+// bundler can supply a single stream implementation. This plugin never uses
+// JSZip's node stream output (all zip I/O is arraybuffer), and when "stream" is
+// left as a runtime require Obsidian warns on mobile ("edit-history attempted
+// to load NodeJS package: stream"). Stub the stream modules to an empty object
+// so the require is gone from the bundle and the plugin loads clean on mobile.
+// JSZip is aliased to its source entry (below) so these requires are visible to
+// esbuild rather than baked into JSZip's prebuilt dist.
+const stubJszipNodeStream = {
+    name: "stub-jszip-node-stream",
+    setup(build) {
+        build.onResolve({ filter: /^(stream|readable-stream)$/ }, () => ({
+            path: "jszip-node-stream-stub",
+            namespace: "jszip-node-stream-stub",
+        }));
+        build.onLoad({ filter: /.*/, namespace: "jszip-node-stream-stub" }, () => ({
+            contents: "module.exports = {};",
+            loader: "js",
+        }));
+    },
+};
+
 const context = await esbuild.context({
     banner: {
         js: banner,
     },
     entryPoints: ["main.ts"],
     bundle: true,
+    plugins: [stubJszipNodeStream],
+    // Bundle JSZip from its source entry, not the prebuilt dist, so the
+    // stream-stub plugin above can intercept its readable-stream/stream requires.
+    alias: {
+        "jszip": path.resolve("node_modules/jszip/lib/index.js"),
+    },
     external: [
         "obsidian",
         "electron",
@@ -78,6 +106,10 @@ const context = await esbuild.context({
     logLevel: "info",
     sourcemap: prod ? false : "inline",
     treeShaking: true,
+    // Minify production builds: JSZip is now bundled from (unminified) source
+    // instead of its prebuilt minified dist, so minifying keeps the artifact
+    // small (and smaller than the previous dist-based build).
+    minify: prod,
     outfile: "main.js",
 });
 
