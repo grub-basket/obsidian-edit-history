@@ -127,6 +127,10 @@ interface EditHistorySettings {
     // Epoch in milliseconds of the last extension scan, 0 if never scanned
     lastExtensionScanTime: number;
     substringBlacklist: string;
+    // Skip capturing history while Obsidian Sync is actively syncing, to avoid
+    // the feedback loop where a synced note write triggers a history write that
+    // then has to be synced (and can conflict across devices)
+    pauseDuringSync: boolean;
     showOnStatusBar: boolean;
     diffDisplayFormat: string;
     showWhitespace: boolean;
@@ -145,6 +149,7 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     extensionScanInterval: "weekly",
     lastExtensionScanTime: 0,
     substringBlacklist: "",
+    pauseDuringSync: true,
     showOnStatusBar: true,
     diffDisplayFormat: DiffDisplayFormat.Inline,
     showWhitespace: true,
@@ -253,6 +258,25 @@ export default class EditHistory extends Plugin {
         const activeFile = this.app.workspace.getActiveFile();
 
         return ((activeFile != null) && (this.keepEditHistoryForFile(activeFile)));
+    }
+
+    /**
+     * @return true if the Obsidian Sync core plugin is enabled and currently
+     *         syncing. Uses the sync plugin's internal instance, which is not a
+     *         public API, so it's wrapped in a try/catch and treated as "not
+     *         syncing" if the shape ever changes. Only detects the official
+     *         Obsidian Sync; filesystem/third-party sync isn't observable here.
+     */
+    isObsidianSyncing(): boolean {
+        try {
+            const sync = (this.app as any).internalPlugins?.plugins?.sync;
+            if ((sync == null) || !sync.enabled) {
+                return false;
+            }
+            return !!sync.instance?.syncing;
+        } catch (e) {
+            return false;
+        }
     }
 
     /**
@@ -924,6 +948,17 @@ export default class EditHistory extends Plugin {
             this.statusBarItemEl.setText((numEdits + 1) + " edits");
         };
         this.registerEvent(this.app.vault.on("modify", (fileOrFolder: TAbstractFile, force: boolean = false) => {
+            // Skip capturing history while Obsidian Sync is actively syncing
+            // (unless this is a forced/manual save). A synced note write fires a
+            // modify here, which would write a new history file that Sync then
+            // has to upload (and which can conflict with the history file the
+            // originating device already synced) -- so pausing breaks that loop.
+            // The change is still captured on the device that made the edit, and
+            // that history file syncs across, so nothing is lost.
+            if (!force && this.settings.pauseDuringSync && this.isObsidianSyncing()) {
+                logDbg("Ignoring modify during Obsidian Sync", fileOrFolder.path);
+                return;
+            }
             // Capture the path and edit time now, at enqueue time (the vault
             // calls this callback synchronously), so a rename or later modify
             // that lands before this one is dequeued can't redirect the history
@@ -2168,6 +2203,17 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                         this.plugin.settings.substringBlacklist = value;
                         await this.plugin.saveSettings();
                     }));
+
+        new Setting(containerEl)
+            .setName("Pause during Obsidian Sync")
+            .setDesc("Don't capture edit history while Obsidian Sync is actively syncing. Recommended: it avoids a slowdown where each synced note write triggers a history write that Sync then has to upload (and that can conflict across devices). The edit is still captured on the device that made it, and that history file syncs across. Manual saves are never paused. Only affects the official Obsidian Sync.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.pauseDuringSync)
+                .onChange(async (value) => {
+                    logInfo("Pause during sync: " + value);
+                    this.plugin.settings.pauseDuringSync = value;
+                    await this.plugin.saveSettings();
+                }));
 
         containerEl.createEl("h3", {text: "Appearance"});
         new Setting(containerEl)
