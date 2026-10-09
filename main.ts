@@ -1,4 +1,5 @@
-import { 
+import {
+    AbstractInputSuggest,
     App,
     ButtonComponent,
     DropdownComponent,
@@ -14,7 +15,8 @@ import {
     TextComponent,
     TFile,
     TFolder,
-    ToggleComponent
+    ToggleComponent,
+    Vault
 } from "obsidian";
 import { DiffMatchPatch, Diff } from "diff-match-patch-ts";
 // diff-match-patch-ts doesn't export properly module enums, it uses a const
@@ -207,10 +209,17 @@ export default class EditHistory extends Plugin {
     // lowercase, empty for none. Note obsidian normalizes paths to use forward
     // slash, so substrings for paths should use forward slashes
     substringBlacklist: string[];
-    // For now this should be "", other values work but the UX is not clear
-    // because the folder will be visible and the user may move it around
-    // breaking things
+    // Vault folder holding all the history files, mirroring the note folders,
+    // or "" to keep each history file alongside its note. Set from the
+    // "History folder" setting, which moves existing history files over
     editHistoryRootFolder: string;
+    // Folders whose history write failure was already reported this session,
+    // so a folder that can't take history files shows one notice, not one per
+    // edit
+    reportedWriteFailureFolders: Set<string> = new Set();
+    // Runs a task on the vault event queue (set in onload), so history folder
+    // moves don't interleave with history writes
+    runOnVaultQueue: (task: () => Promise<void>) => Promise<void>;
 
     /**
      * @return true if an edit history file should be kept for this file
@@ -224,6 +233,11 @@ export default class EditHistory extends Plugin {
         // The vault will call on change callback on the edit history file when
         // modified using the Obsidian API, trap it so it's ignored downstream
         if (file.name.endsWith(EDIT_HISTORY_FILE_EXT)) {
+            return false;
+        }
+
+        // Nothing inside the history folder is a note
+        if ((this.editHistoryRootFolder != "") && file.path.startsWith(this.editHistoryRootFolder + "/")) {
             return false;
         }
 
@@ -346,6 +360,169 @@ export default class EditHistory extends Plugin {
 
     getEditHistoryFilepath(filepath: string): string {
         return normalizePath(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
+    }
+
+    /**
+     * @return the history folder setting value in canonical form: "" for
+     *         alongside the notes, otherwise a vault path without leading or
+     *         trailing slashes
+     */
+    normalizeHistoryFolder(folder: string): string {
+        const trimmed = folder.trim().replace(/^[/\\]+|[/\\]+$/g, "");
+        return (trimmed == "") ? "" : normalizePath(trimmed);
+    }
+
+    /**
+     * @return why the given (normalized) folder can't be the history folder,
+     *         or null if it can
+     */
+    checkHistoryFolder(folder: string): string | null {
+        if (folder == "") {
+            return null;
+        }
+        // Obsidian doesn't index dot folders, so history files there could be
+        // written but never found again
+        if (folder.split("/").some(part => part.startsWith("."))) {
+            return "Folder names can't start with a dot: Obsidian doesn't see dot folders, so the history saved there couldn't be read back.";
+        }
+        const current = this.editHistoryRootFolder;
+        if ((current != "") && (folder.startsWith(current + "/") || current.startsWith(folder + "/"))) {
+            return "The new history folder can't be inside the current one, or contain it.";
+        }
+        const existing = this.app.vault.getAbstractFileByPath(folder);
+        if (existing instanceof TFile) {
+            return "\"" + folder + "\" is a file, not a folder.";
+        }
+        if (existing instanceof TFolder) {
+            // History paths mirror note paths, so notes living in the history
+            // folder would get mixed up with the history files
+            let hasNotes = false;
+            Vault.recurseChildren(existing, (child: TAbstractFile) => {
+                if ((child instanceof TFile) && !child.name.endsWith(EDIT_HISTORY_FILE_EXT)) {
+                    hasNotes = true;
+                }
+            });
+            if (hasNotes) {
+                return "\"" + folder + "\" already has notes in it. Pick a new or empty folder.";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @return the history files to move when the history folder changes from
+     *         oldFolder to newFolder, as [file, new path] pairs
+     */
+    planHistoryFolderMoves(oldFolder: string, newFolder: string): [TFile, string][] {
+        const prefix = (oldFolder == "") ? "" : oldFolder + "/";
+        const moves: [TFile, string][] = [];
+        for (const file of this.app.vault.getFiles()) {
+            if (!file.path.endsWith(EDIT_HISTORY_FILE_EXT) || !file.path.startsWith(prefix)) {
+                continue;
+            }
+            const notePath = file.path.slice(prefix.length, file.path.length - EDIT_HISTORY_FILE_EXT.length);
+            // When the history files are next to the notes, only those whose
+            // note exists are known to be "alongside" ones: a history file
+            // left behind in an old history folder (eg one that couldn't be
+            // moved out) would otherwise be nested inside the new one
+            if ((oldFolder == "") && (this.app.vault.getAbstractFileByPath(notePath) == null)) {
+                continue;
+            }
+            const newPath = normalizePath(newFolder + "/" + notePath + EDIT_HISTORY_FILE_EXT);
+            if (newPath != file.path) {
+                moves.push([file, newPath]);
+            }
+        }
+        return moves;
+    }
+
+    /**
+     * Switch the history folder and move the existing history files there.
+     * Runs on the vault event queue so no history write lands in between.
+     * Never overwrites: a history file already at the destination is left
+     * where it was.
+     */
+    async changeHistoryFolder(newFolder: string): Promise<void> {
+        await this.runOnVaultQueue(async () => {
+            const oldFolder = this.editHistoryRootFolder;
+            const moves = this.planHistoryFolderMoves(oldFolder, newFolder);
+            this.settings.editHistoryRootFolder = newFolder;
+            await this.saveSettings();
+            this.reportedWriteFailureFolders.clear();
+
+            let moved = 0;
+            let copied = 0;
+            const skipped: string[] = [];
+            const failed: string[] = [];
+            for (const [file, newPath] of moves) {
+                if (this.app.vault.getAbstractFileByPath(newPath) != null) {
+                    skipped.push(file.path);
+                    continue;
+                }
+                const dirpath = newPath.substring(0, newPath.lastIndexOf("/"));
+                if (dirpath != "") {
+                    await this.app.vault.createFolder(dirpath).catch(() => null);
+                }
+                try {
+                    await this.app.vault.rename(file, newPath);
+                    moved++;
+                } catch (e) {
+                    // A rename can be refused, eg Folder Bridge doesn't move
+                    // files out of a mounted folder. Copy instead and leave the
+                    // original in place
+                    logWarn("Can't move history file, copying instead", file.path, e);
+                    try {
+                        await this.app.vault.createBinary(newPath, await this.app.vault.readBinary(file));
+                        copied++;
+                    } catch (e2) {
+                        logError("Can't copy history file", file.path, e2);
+                        failed.push(file.path);
+                    }
+                }
+            }
+
+            const where = (newFolder == "") ? "next to each note" : "to \"" + newFolder + "\"";
+            let message = "Edit History: history files are now saved " + where + ".";
+            if (moves.length > 0) {
+                message += " Moved " + moved + " of " + moves.length + " existing history files.";
+            }
+            if (copied > 0) {
+                message += " " + copied + " couldn't be moved, so they were copied and the originals left in place.";
+            }
+            if (skipped.length > 0) {
+                message += " " + skipped.length + " were left where they were because a history file already existed at the new place.";
+                logWarn("History files left in place (destination exists):", skipped);
+            }
+            if (failed.length > 0) {
+                message += " " + failed.length + " couldn't be moved or copied; their history won't show until the folder is changed back.";
+                logError("History files that couldn't be moved:", failed);
+            }
+            if ((skipped.length > 0) || (failed.length > 0)) {
+                message += " The file list is in the developer console.";
+            }
+            new Notice(message, (moved == moves.length) ? 5000 : 0);
+        });
+    }
+
+    /**
+     * Tell the user, once per folder per session, that a history file
+     * couldn't be written, eg because the note lives in a read-only or
+     * filtered folder (like a Folder Bridge "notes only" mount). Without this
+     * the failure only reaches the console and history silently stops
+     */
+    reportHistoryWriteFailure(notePath: string, error: unknown) {
+        logError("Can't save edit history for", notePath, error);
+        const folder = notePath.substring(0, notePath.lastIndexOf("/"));
+        if (this.reportedWriteFailureFolders.has(folder)) {
+            return;
+        }
+        this.reportedWriteFailureFolders.add(folder);
+        const reason = (error instanceof Error) ? error.message : String(error ?? "unknown error");
+        let message = "Edit History couldn't save the history of \"" + notePath + "\": " + reason;
+        if (this.editHistoryRootFolder == "") {
+            message += "\n\nTo keep history for notes in this folder, set a History folder in Edit History's settings. History is then saved inside this vault instead of next to each note.";
+        }
+        new Notice(message, 0);
     }
 
     getEditCompressedSize(zip: JSZip, filepath: string): number {
@@ -561,8 +738,6 @@ export default class EditHistory extends Plugin {
         this.knownExtensions = this.commaSeparatedToList(settings.knownExtensions);
         this.substringBlacklist = this.commaSeparatedToList(settings.substringBlacklist);
         this.maxEditHistoryFileSize = parseInt(settings.maxHistoryFileSizeKB) * 1024 || Infinity;
-        // XXX Note this is currently not updated in the settings modal, so the
-        //     value is unchanged
         this.editHistoryRootFolder = settings.editHistoryRootFolder;
     }
 
@@ -601,6 +776,9 @@ export default class EditHistory extends Plugin {
                 .then(task)
                 .catch((e) => logError("Error in edit history vault handler", e));
         };
+        this.runOnVaultQueue = (task: () => Promise<void>) => new Promise<void>((resolve) => {
+            enqueue(() => task().finally(resolve));
+        });
         const processModify = async (fileOrFolder: TAbstractFile, force: boolean = false, enqueuedPath?: string, enqueuedMtime?: number) => {
             logInfo("vault modify", fileOrFolder.path);
             // This reports any files or folders modified via the api, ignore
@@ -935,14 +1113,25 @@ export default class EditHistory extends Plugin {
                 let dirpath = zipFilepath.substring(0, zipFilepath.lastIndexOf("/")+1);
                 logInfo("Conservatively creating dir", dirpath);
                 await this.app.vault.createFolder(dirpath).catch(()=>null);
-                let zipFile = await this.app.vault.createBinary(zipFilepath, newZipData);
+                let zipFile;
+                try {
+                    zipFile = await this.app.vault.createBinary(zipFilepath, newZipData);
+                } catch (e) {
+                    this.reportHistoryWriteFailure(enqueuedPath ?? file.path, e);
+                    return;
+                }
                 if (zipFile == null) {
                     logError("Can't create edit history file", zipFilepath);
                     return;
                 }
             } else {
                 // Update the zip file
-                await this.app.vault.modifyBinary(zipFile, newZipData);
+                try {
+                    await this.app.vault.modifyBinary(zipFile, newZipData);
+                } catch (e) {
+                    this.reportHistoryWriteFailure(enqueuedPath ?? file.path, e);
+                    return;
+                }
             }
             // XXX This needs to update when switching panes, etc, or set a timer
             this.statusBarItemEl.setText((numEdits + 1) + " edits");
@@ -974,20 +1163,20 @@ export default class EditHistory extends Plugin {
             // non whitelisted files/folders
             // Note if a folder is renamed each children will get a call here
             // with the new path
-            if ((file instanceof TFolder) && (file.path == this.editHistoryRootFolder)) {
-                // The history file root folder is being renamed, update in the
-                // settings
-                
-                // XXX This may not work depending on the renaming of the
-                //     history root folder and history files vs. original notes?
-                //     But note the history edit file folder is set to "" for
-                //     the time being, so this code won't run and this is not an
-                //     issue yet
-                logInfo("Renaming history folder, updating settings from", 
-                    this.settings.editHistoryRootFolder, "to", file.path);
-                this.settings.editHistoryRootFolder = file.path;
-                this.saveSettings();
-            } 
+            const rootFolder = this.editHistoryRootFolder;
+            if ((file instanceof TFolder) && (rootFolder != "") &&
+                ((oldPath == rootFolder) || rootFolder.startsWith(oldPath + "/"))) {
+                // The history folder (or a folder containing it) was renamed or
+                // moved in the file explorer: follow it. The history files
+                // inside moved along with it and get their own rename events,
+                // which are ignored below
+                const newRootFolder = file.path + rootFolder.slice(oldPath.length);
+                logInfo("Renaming history folder, updating settings from",
+                    rootFolder, "to", newRootFolder);
+                this.settings.editHistoryRootFolder = newRootFolder;
+                await this.saveSettings();
+                return;
+            }
 
             if (!(this.keepEditHistoryForFile(file))) {
                 logDbg("Ignoring non whitelisted file", file.path);
@@ -1020,6 +1209,12 @@ export default class EditHistory extends Plugin {
             if (zipFile != null) {
                 let newZipFilepath = this.getEditHistoryFilepath(file.path);
                 logInfo("Renaming edit history file", zipFilepath,"to", newZipFilepath);
+                if (rootFolder != "") {
+                    // In the history folder the note's new parent may not have
+                    // a mirror folder yet
+                    const dirpath = newZipFilepath.substring(0, newZipFilepath.lastIndexOf("/"));
+                    await this.app.vault.createFolder(dirpath).catch(() => null);
+                }
                 await this.app.vault.rename(zipFile, newZipFilepath);
             }
         };
@@ -2014,6 +2209,81 @@ class EditHistoryModal extends Modal {
     }
 }
 
+/**
+ * Yes/no question in a modal. ask() resolves true only when the confirm
+ * button is pressed; closing the modal any other way resolves false
+ */
+class ConfirmModal extends Modal {
+    private confirmed = false;
+    private resolve: ((confirmed: boolean) => void) | null = null;
+
+    constructor(app: App, private title: string, private message: string, private confirmText: string) {
+        super(app);
+    }
+
+    ask(): Promise<boolean> {
+        return new Promise((resolve) => {
+            this.resolve = resolve;
+            this.open();
+        });
+    }
+
+    onOpen() {
+        this.titleEl.setText(this.title);
+        this.contentEl.createEl("p", { text: this.message });
+        new Setting(this.contentEl)
+            .addButton(button => button
+                .setButtonText("Cancel")
+                .onClick(() => this.close()))
+            .addButton(button => button
+                .setButtonText(this.confirmText)
+                .setCta()
+                .onClick(() => {
+                    this.confirmed = true;
+                    this.close();
+                }));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+        this.resolve?.(this.confirmed);
+        this.resolve = null;
+    }
+}
+
+/**
+ * Suggest vault folders while typing in inputEl. AbstractInputSuggest only
+ * exists from Obsidian 1.4.10, so on older versions the field stays a plain
+ * text box (the class is defined here, not at the top level, so loading the
+ * plugin doesn't touch it)
+ */
+function attachFolderSuggest(app: App, inputEl: HTMLInputElement) {
+    if (typeof AbstractInputSuggest !== "function") {
+        return;
+    }
+    class FolderSuggest extends AbstractInputSuggest<string> {
+        getSuggestions(query: string): string[] {
+            const q = query.toLowerCase();
+            return app.vault.getAllLoadedFiles()
+                .filter((f): f is TFolder => (f instanceof TFolder) && !f.isRoot())
+                .map(f => f.path)
+                .filter(p => p.toLowerCase().contains(q))
+                .slice(0, 50);
+        }
+
+        renderSuggestion(value: string, el: HTMLElement) {
+            el.setText(value);
+        }
+
+        selectSuggestion(value: string) {
+            inputEl.value = value;
+            inputEl.dispatchEvent(new Event("input"));
+            this.close();
+        }
+    }
+    new FolderSuggest(app, inputEl);
+}
+
 class EditHistorySettingTab extends PluginSettingTab { plugin:
     EditHistory;
 
@@ -2204,6 +2474,65 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                         await this.plugin.saveSettings();
                     }));
 
+        const historyFolderDesc = createFragment(frag => {
+            frag.appendText("Where history files are saved. Leave empty to save each one next to its note (Budget.md gets Budget.md.edtz). ");
+            frag.appendText("Set a folder, for example \"Edit History\", to keep all history in one place inside this vault, in the same folder layout as your notes. ");
+            frag.appendText("That's useful for notes in shared or mounted folders, where history files would be visible to others or can't be written. ");
+            frag.appendText("Type a folder and press Apply; changing it moves the existing history files. Don't rename or move folders inside the history folder by hand.");
+        });
+        let historyFolderText: TextComponent;
+        let applying = false;
+        // Applied explicitly, not per keystroke: each change moves history
+        // files around
+        const applyHistoryFolder = async () => {
+            if (applying) {
+                return;
+            }
+            const plugin = this.plugin;
+            const current = plugin.editHistoryRootFolder;
+            const folder = plugin.normalizeHistoryFolder(historyFolderText.getValue());
+            if (folder == current) {
+                historyFolderText.setValue(current);
+                return;
+            }
+            const problem = plugin.checkHistoryFolder(folder);
+            if (problem != null) {
+                new Notice(problem);
+                return;
+            }
+            applying = true;
+            try {
+                const count = plugin.planHistoryFolderMoves(current, folder).length;
+                const from = (current == "") ? "next to their notes" : "\"" + current + "\"";
+                const to = (folder == "") ? "next to their notes" : "\"" + folder + "\"";
+                const confirmed = (count == 0) || await new ConfirmModal(this.app,
+                    "Move history files?",
+                    "Move " + count + " history file" + ((count == 1) ? "" : "s") + " from " + from + " to " + to + "? Nothing is overwritten.",
+                    "Move").ask();
+                if (!confirmed) {
+                    historyFolderText.setValue(current);
+                    return;
+                }
+                await plugin.changeHistoryFolder(folder);
+                this.display();
+            } finally {
+                applying = false;
+            }
+        };
+        new Setting(containerEl)
+            .setName("History folder")
+            .setDesc(historyFolderDesc)
+            .setClass("edit-history-folder-setting")
+            .addText(text => {
+                historyFolderText = text;
+                text.setPlaceholder("Next to each note")
+                    .setValue(this.plugin.settings.editHistoryRootFolder);
+                attachFolderSuggest(this.app, text.inputEl);
+            })
+            .addButton(button => button
+                .setButtonText("Apply")
+                .onClick(() => applyHistoryFolder()));
+
         new Setting(containerEl)
             .setName("Pause during Obsidian Sync")
             .setDesc("Don't capture edit history while Obsidian Sync is actively syncing. Recommended: it avoids a slowdown where each synced note write triggers a history write that Sync then has to upload (and that can conflict across devices). The edit is still captured on the device that made it, and that history file syncs across. Manual saves are never paused. Only affects the official Obsidian Sync.")
@@ -2268,75 +2597,21 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                 }));
 
 
-        /* XXX Issues with allowing a user-configured history folder: 
-            - any history folder will mimic the the structure of the note
-              directory (alternatively history files could be on a flat
-              directory with the name coming from a hash of the full path, but
-              that makes renaming more involved, and fishing for history files
-              less intuitive)
-
-            - due to an Obsidian design decision, folders cannot start with "."
-              so the user-defined history folder be visible in the file explorer
-                - Note this limitation is not consistently enforced through the
-                    API:
-                    - Obsidian does allow createBinary on a path starting with a
-                      dot and it successfully creates the file
-                    - Unfortunately getAbstractFileFromPath on a path starting
-                      with a dot fails so the file can be created (which only
-                      requires the path) but not modified (which requires a
-                      TAbstractFile)
-
-            - because it's visible, the user can rename the edit history folder
-              from the obsidian UI,
-                - renaming the topmost directory could be supported since the
-                  only thing needed would be to update the internal variable.
-                  Obisidan API notifies of the top level rename and each
-                  children, which can be ignored. This will need care depending
-                  on the reporting order of root vs. children and the update of
-                  the internal variable.
-                - if the user renames a non-top level directory then all
-                  children history files would go out of sync, so this is a
-                  problem.
-
-            - the Obsidian setting onChange gets called on every keystroke, so
-               configuring the edit history folder in settings would cause a
-               rename on each keystroke. There doesn't seem to be a final
-               changed(), hide() is not called either
-
-            - it's not clear whether the folder should be deleted if empty
-
-            - it's not clear if it's safe to just copy all the files found with
-              whatever extension new Setting(containerEl) .setName('Edits
-              folder') .setDesc('Folder to store the edit history file. Empty to
-              store the edit file in the same directory alongside the original
-              file. Due to Obsidian limitations this must start with a character
-              other than "."') .addText(text => text .setPlaceholder('Enter the
-              folder name')
-              .setValue(this.plugin.settings.editHistoryRootFolder)
-              .onChange(async (value) => { logInfo("onChange"); logInfo('Edits
-              folder: ' + value); // Only allow top level folders
-
-                    this.plugin.settings.editHistoryRootFolder = value;
-
-
-            XXX Can the folder just be renamed via the file explorer
-            interface? 
-
-            XXX Check no dir component starts with "." 
-
-            XXX Delete edits? copy them to new folder? trash them? 
-
-            XXX Ask the user to delete folder? 
-
-            XXX Ask for confirmation? 
-
-            XXX Use private apis to store in some hidden folder? 
-
-            XXX This could use the adapter apis instead of the vault apis //
-            be able to access the .obsidian dir? (or any other?)
-
-            XXX The directory doesn't need to be created on every keystroke,
-            it could have a create/commit button?
+        /* Notes on the "History folder" setting (General section above):
+            - the history folder mirrors the note folders (alternatively a
+              flat folder of hashed names, but that makes renames more
+              involved and history files harder to find by hand)
+            - it can't be a dot folder: Obsidian doesn't index those, so
+              createBinary works there but getAbstractFileByPath returns null
+              and the file can never be modified or read back via the vault
+            - it's applied with a button, not per keystroke, since each change
+              moves every history file; moves never overwrite, and a refused
+              rename (eg out of a Folder Bridge mount) falls back to a copy
+            - renaming or moving the history folder (or a folder containing
+              it) in the file explorer is followed by the rename handler;
+              renaming folders INSIDE it desyncs those history files, which
+              the setting description warns about
+            - folders emptied by a move are left in place
         */
 
 
