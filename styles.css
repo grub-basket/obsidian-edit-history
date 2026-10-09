@@ -24,6 +24,17 @@
     user-select: none;
 }
 
+/* History folder setting: keep the text box usable next to its Apply button
+   on narrow (mobile) settings panes */
+.edit-history-folder-setting .setting-item-control {
+    flex-wrap: wrap;
+}
+
+.edit-history-folder-setting .setting-item-control input[type="text"] {
+    flex: 1 1 12em;
+    min-width: 12em;
+}
+
 .edit-history-chip:hover {
     background-color: var(--background-modifier-active-hover);
 }
