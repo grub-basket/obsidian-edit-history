@@ -447,7 +447,17 @@ export default class EditHistory extends Plugin {
             const oldFolder = this.editHistoryRootFolder;
             const moves = this.planHistoryFolderMoves(oldFolder, newFolder);
             this.settings.editHistoryRootFolder = newFolder;
-            await this.saveSettings();
+            try {
+                await this.saveSettings();
+            } catch (e) {
+                // Nothing moved yet: put the old folder back so the setting
+                // and the files stay in agreement
+                logError("Can't save the history folder setting", e);
+                this.settings.editHistoryRootFolder = oldFolder;
+                this.parseSettings(this.settings);
+                new Notice("Edit History: couldn't save the new history folder, so nothing was moved. " + ((e instanceof Error) ? e.message : String(e)), 0);
+                return;
+            }
             this.reportedWriteFailureFolders.clear();
 
             let moved = 0;
@@ -744,6 +754,13 @@ export default class EditHistory extends Plugin {
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
         this.parseSettings(this.settings);
+    }
+
+    // Settings changed on disk, eg synced from another device: pick them up,
+    // so a history folder chosen there is used here too
+    async onExternalSettingsChange() {
+        await this.loadSettings();
+        this.statusBarItemEl?.toggle(this.settings.showOnStatusBar);
     }
 
     async saveSettings() {
@@ -1163,20 +1180,9 @@ export default class EditHistory extends Plugin {
             // non whitelisted files/folders
             // Note if a folder is renamed each children will get a call here
             // with the new path
+            // A renamed history folder was already followed when the event
+            // arrived (see the rename callback below)
             const rootFolder = this.editHistoryRootFolder;
-            if ((file instanceof TFolder) && (rootFolder != "") &&
-                ((oldPath == rootFolder) || rootFolder.startsWith(oldPath + "/"))) {
-                // The history folder (or a folder containing it) was renamed or
-                // moved in the file explorer: follow it. The history files
-                // inside moved along with it and get their own rename events,
-                // which are ignored below
-                const newRootFolder = file.path + rootFolder.slice(oldPath.length);
-                logInfo("Renaming history folder, updating settings from",
-                    rootFolder, "to", newRootFolder);
-                this.settings.editHistoryRootFolder = newRootFolder;
-                await this.saveSettings();
-                return;
-            }
 
             if (!(this.keepEditHistoryForFile(file))) {
                 logDbg("Ignoring non whitelisted file", file.path);
@@ -1222,6 +1228,24 @@ export default class EditHistory extends Plugin {
         // by then any earlier-enqueued modify has already flushed to the old
         // path, so the history file exists to be moved
         this.registerEvent(this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+            // The history folder (or a folder containing it) was renamed or
+            // moved in the file explorer: follow it right away, in memory,
+            // before any queued task runs. The history files already moved
+            // on disk with the folder, so every task still in the queue
+            // (modifies queued before the rename, and the renames of the
+            // folder's notes, which Obsidian may report before or after the
+            // folder itself) must look them up under the new path
+            const rootFolder = this.editHistoryRootFolder;
+            if ((file instanceof TFolder) && (rootFolder != "") &&
+                ((oldPath == rootFolder) || rootFolder.startsWith(oldPath + "/"))) {
+                const newRootFolder = file.path + rootFolder.slice(oldPath.length);
+                logInfo("Renaming history folder, updating settings from",
+                    rootFolder, "to", newRootFolder);
+                this.settings.editHistoryRootFolder = newRootFolder;
+                this.editHistoryRootFolder = newRootFolder;
+                enqueue(() => this.saveSettings());
+                return;
+            }
             enqueue(() => processRename(file, oldPath));
         }));
 
