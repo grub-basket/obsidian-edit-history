@@ -2,6 +2,8 @@
 
 This plugin saves each edit done to a note into a edit history file, the edits can later be diffed or copied.
 
+> **About this fork.** This is a maintained fork of [antoniotejada/obsidian-edit-history](https://github.com/antoniotejada/obsidian-edit-history). Upstream has been quiet since its 0.3.0 release, so this fork combines the fixes offered there as pull requests (#44, #45, #51, #52 and others) with a few additions, such as a "History folder" setting that keeps all history files in one folder inside the vault. The `main` branch is the fork; `master` mirrors upstream. To install with [BRAT](https://github.com/TfTHacker/obsidian42-brat), add `grub-basket/obsidian-edit-history`. Changes are listed under [0.3.1](#031-fork) below.
+
 ![image](https://github.com/user-attachments/assets/e02be307-6945-46af-a8c0-02adbc48212d)
 
 This is similar to the [File Recovery](https://help.obsidian.md/Plugins/File+recovery) core plugin with the following advantages:
@@ -62,6 +64,18 @@ Each entry in the file is named after the UTC epoch in seconds at which time the
 ## Versions
 
 [Github releases](https://github.com/antoniotejada/obsidian-edit-history/releases)
+
+### [0.3.1](https://github.com/grub-basket/obsidian-edit-history/releases/tag/0.3.1) (fork)
+- New "History folder" setting: keep all history files in one vault folder (mirroring the note folders) instead of next to each note. Changing it moves the existing history files without overwriting anything, and renaming the folder in the file explorer is followed. Useful for notes in shared or mounted folders.
+- A notice (once per folder) when a history file can't be saved, instead of history silently stopping.
+- History handling is serialized per note, fixing lost history when edits and renames happen quickly ([#45](https://github.com/antoniotejada/obsidian-edit-history/pull/45)).
+- Corrupt or externally changed history files are handled safely ([#44](https://github.com/antoniotejada/obsidian-edit-history/pull/44)).
+- The status bar follows the active tab and shows clearer states ([#51](https://github.com/antoniotejada/obsidian-edit-history/pull/51)).
+- No "attempted to load NodeJS package: stream" warning on mobile ([#52](https://github.com/antoniotejada/obsidian-edit-history/pull/52)).
+- Apostrophes and slashes display correctly in the diff view.
+- `.base` and `.canvas` files are tracked by default; file type chips in the settings, and a periodic scan (weekly by default, can be turned off) that tells you about new file types in the vault.
+- History capture pauses while Obsidian Sync is syncing (a setting, on by default).
+- Building no longer copies the plugin into every vault; installing into a vault is opt-in (`EDIT_HISTORY_VAULT=<vault folder>`).
 
 ### [0.3.0](https://github.com/antoniotejada/obsidian-edit-history/releases/tag/0.3.0) (2025-08-03)
 - Implemented #6 note path substring blacklist
