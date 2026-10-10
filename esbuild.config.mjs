@@ -6,15 +6,32 @@ import path from "path";
 
 function copyArtifactsToDirectory(artifacts, dirpath) {
     console.log("Copying artifacts to dirpath", dirpath);
-    try {
-        //console.debug("Creating dir", dirpath);
-        fs.mkdirSync(dirpath).catch(() => null);
-    } catch {
-    }
+    fs.mkdirSync(dirpath, { recursive: true });
     for (let artifact of artifacts) {
         const outFilepath = path.join(dirpath, artifact);
         //console.debug("copying", artifact, "to", outFilepath);
-        fs.copyFileSync(artifact, outFilepath);	
+        fs.copyFileSync(artifact, outFilepath);
+    }
+}
+
+// Installing the build into vaults is opt-in: a plain `npm run build` must
+// never write into the vaults of whoever builds it (on Windows the old default
+// copied into EVERY vault in Obsidian's vault list).
+//   EDIT_HISTORY_VAULT=<vault folder>  copy into that one vault's plugin folder
+//   EDIT_HISTORY_DEPLOY=all-vaults     copy into every vault Obsidian knows (Windows only)
+function installArtifacts(artifacts) {
+    const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+    const vault = process.env.EDIT_HISTORY_VAULT;
+    if (vault) {
+        if (!fs.existsSync(path.join(vault, ".obsidian"))) {
+            console.error(`EDIT_HISTORY_VAULT "${vault}" is not an Obsidian vault (no .obsidian folder); nothing copied.`);
+            return;
+        }
+        copyArtifactsToDirectory(artifacts, path.join(vault, ".obsidian", "plugins", manifest.id));
+    } else if (process.env.EDIT_HISTORY_DEPLOY === "all-vaults") {
+        copyArtifactsToVaults(artifacts);
+    } else {
+        console.log("Built main.js. To install it into a vault, set EDIT_HISTORY_VAULT=<vault folder> (or copy main.js, manifest.json and styles.css into <vault>/.obsidian/plugins/" + manifest.id + "/).");
     }
 }
 
@@ -118,8 +135,8 @@ let artifacts = ["main.js", "manifest.json", "styles.css"];
 if (prod) {
     let buildResult = await context.rebuild();
     if ((buildResult.errors.length == 0) && (buildResult.warnings.length == 0)) {
-        copyArtifactsToVaults(artifacts);
-        
+        installArtifacts(artifacts);
+
         let manifestData = fs.readFileSync("manifest.json", "utf8");
         let manifest = JSON.parse(manifestData);
         copyArtifactsToDirectory(artifacts, path.join("releases", manifest.version));
