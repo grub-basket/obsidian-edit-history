@@ -137,9 +137,13 @@ if (prod) {
     if ((buildResult.errors.length == 0) && (buildResult.warnings.length == 0)) {
         installArtifacts(artifacts);
 
-        let manifestData = fs.readFileSync("manifest.json", "utf8");
-        let manifest = JSON.parse(manifestData);
-        copyArtifactsToDirectory(artifacts, path.join("releases", manifest.version));
+        // releases/<version> is committed: only "npm run release" refreshes
+        // it, so an everyday build leaves the working tree clean
+        if (process.argv[3] === "release") {
+            let manifestData = fs.readFileSync("manifest.json", "utf8");
+            let manifest = JSON.parse(manifestData);
+            copyArtifactsToDirectory(artifacts, path.join("releases", manifest.version));
+        }
     }
     process.exit(0);
 } else {

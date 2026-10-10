@@ -59,6 +59,12 @@ This most recent version may not be the latest version of the note if a non-zero
 
 Each entry in the file is named after the UTC epoch in seconds at which time the edit was made, encoded as chars, and ending in "$" if the entry is stored in full, otherwise stored as a diff.
 
+## Building
+
+- `npm install`, then `npm run build`. The build lands in `main.js` and is not copied into any vault.
+- To install it into one vault, set `EDIT_HISTORY_VAULT` to that vault's folder, for example `EDIT_HISTORY_VAULT="/path/to/Test Vault" npm run build` (PowerShell: `$env:EDIT_HISTORY_VAULT="C:\Test Vault"; npm run build`). A folder without `.obsidian` is refused.
+- `npm run release` also refreshes the committed `releases/<version>/` files. Use it only when making a release.
+
 ## Versions
 
 [Github releases](https://github.com/antoniotejada/obsidian-edit-history/releases)
