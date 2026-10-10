@@ -287,6 +287,13 @@ export default class EditHistory extends Plugin {
             if ((sync == null) || !sync.enabled) {
                 return false;
             }
+            // Sync is on by default in new vaults but not connected to a
+            // remote vault (vaultId null); its "syncing" flag still turns on
+            // at times then, which would drop every edit. Nothing is synced
+            // without a remote vault, so never pause in that case
+            if ((sync.instance != null) && ("vaultId" in sync.instance) && !sync.instance.vaultId) {
+                return false;
+            }
             return !!sync.instance?.syncing;
         } catch (e) {
             return false;
